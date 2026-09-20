@@ -1,38 +1,26 @@
-
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Trend, Rate, Counter } from 'k6/metrics';
 import { SharedArray } from 'k6/data';
 
-/**
- * =========================
- * Configuración por entorno
- * =========================
- */
 const BASE_URL   = __ENV.BASE_URL || 'http://localhost:8080';
-const DATA_FILE  = __ENV.DATA_FILE || null; // si no viene, el script intentará rutas por defecto
+const DATA_FILE  = __ENV.DATA_FILE || null;
 const SCENARIO   = (__ENV.SCENARIO || 'baseline').toLowerCase();
 const TIMEOUT_MS = Number(__ENV.TIMEOUT_MS || 2000);
-const SLEEP_MS   = Number(__ENV.SLEEP_MS || 0); // micro-pausa opcional entre iteraciones
+const SLEEP_MS   = Number(__ENV.SLEEP_MS || 0);
 
-/**
- * =========================
- * Métricas personalizadas
- * =========================
- */
-const registerDuration = new Trend('register_duration');     // duración de /register
-const registerFailed   = new Rate('register_failed');        // check fallido
-const statusCount      = new Counter('status_count');        // contador de respuestas por código
+const registerDuration = new Trend('register_duration');
 
-/**
- * =========================
- * Carga de dataset (CSV)
- * =========================
- * El script intenta, en orden:
- * - __ENV.DATA_FILE (si se definió)
- * - 'perf/data/persons.csv' (ejecución desde la raíz del repo)
- * - '../data/persons.csv' (si se ejecuta dentro de perf/scripts)
- */
+// Métricas de resultados de negocio
+const registerValid = new Rate('register_valid');
+const registerDuplicated = new Rate('register_duplicated');
+const registerBusinessUnexpected = new Rate('register_business_unexpected');
+
+// Métrica exclusiva para errores técnicos / HTTP inesperados
+const registerTechnicalFailed = new Rate('register_technical_failed');
+
+const statusCount = new Counter('status_count');
+
 function tryOpen(path) {
   try {
     return open(path);
@@ -43,33 +31,45 @@ function tryOpen(path) {
 
 const persons = new SharedArray('persons', function () {
   let csvText = null;
+
   if (DATA_FILE) {
     csvText = tryOpen(DATA_FILE);
+
     if (!csvText) {
-      throw new Error(`No se pudo abrir DATA_FILE='${DATA_FILE}'. Verifica la ruta.`);
+      throw new Error(
+        `No se pudo abrir DATA_FILE='${DATA_FILE}'. Verifica la ruta.`
+      );
     }
   } else {
     csvText = tryOpen('perf/data/persons.csv') || tryOpen('../data/persons.csv');
+
     if (!csvText) {
-      throw new Error("No se encontró persons.csv. Usa __ENV.DATA_FILE o ejecuta desde la raíz del repo.");
+      throw new Error(
+        'No se encontró persons.csv. Usa __ENV.DATA_FILE o ejecuta desde la raíz del repo.'
+      );
     }
   }
+
   const lines = csvText.trim().split(/\r?\n/);
-  const header = lines.shift(); // descartar cabecera
+  lines.shift(); // Eliminar encabezado
+
   return lines.map((l) => {
-    // CSV simple: id,name,age,gender,alive
     const parts = l.split(',');
-    const [id, name, age, gender, alive] = parts.map((x) => String(x).trim());
-    return { id: Number(id), name, age: Number(age), gender, alive: alive.toLowerCase() === 'true' };
+
+    const [id, name, age, gender, alive] = parts.map((x) =>
+      String(x).trim()
+    );
+
+    return {
+      id: Number(id),
+      name,
+      age: Number(age),
+      gender,
+      alive: alive.toLowerCase() === 'true',
+    };
   });
 });
 
-/**
- * =========================
- * Escenarios disponibles
- * =========================
- * Pueden activarse por __ENV.SCENARIO
- */
 const ALL_SCENARIOS = {
   baseline: {
     executor: 'constant-vus',
@@ -77,6 +77,7 @@ const ALL_SCENARIOS = {
     duration: '5m',
     gracefulStop: '30s',
   },
+
   load: {
     executor: 'ramping-vus',
     startVUs: 0,
@@ -87,6 +88,7 @@ const ALL_SCENARIOS = {
     ],
     gracefulRampDown: '30s',
   },
+
   stress: {
     executor: 'ramping-vus',
     startVUs: 200,
@@ -97,24 +99,26 @@ const ALL_SCENARIOS = {
     ],
     gracefulRampDown: '30s',
   },
+
   spike: {
     executor: 'ramping-vus',
     startVUs: 50,
     stages: [
-      { duration: '1m', target: 300 }, // pico rápido
-      { duration: '2m', target: 50 },  // recuperación
+      { duration: '1m', target: 300 },
+      { duration: '2m', target: 50 },
       { duration: '1m', target: 0 },
     ],
     gracefulRampDown: '30s',
   },
+
   soak: {
     executor: 'constant-vus',
     vus: 100,
     duration: '2h',
     gracefulStop: '1m',
   },
+
   regression: {
-    // Ejecución corta pensada para comparar builds (antes/después)
     executor: 'constant-vus',
     vus: 20,
     duration: '5m',
@@ -122,47 +126,54 @@ const ALL_SCENARIOS = {
   },
 };
 
-// Construcción dinámica de options según SCENARIO
 function buildOptions() {
   const chosen = ALL_SCENARIOS[SCENARIO];
+
   if (!chosen) {
-    console.warn(`SCENARIO='${SCENARIO}' no reconocido. Usando 'baseline'.`);
+    console.warn(
+      `SCENARIO='${SCENARIO}' no reconocido. Usando 'baseline'.`
+    );
   }
+
   return {
     thresholds: {
-      http_req_failed: ['rate<0.01'],             // <1% de fallos HTTP globales
-      'http_req_duration{status:200}': ['p(95)<300', 'p(99)<800'], // SLO sugeridos
-      register_failed: ['rate<0.01'],             // <1% de fallos de validación
+      // Error técnico HTTP menor al 1%
+      http_req_failed: ['rate<0.01'],
+
+      // Rendimiento
+      'http_req_duration{status:200}': [
+        'p(95)<300',
+        'p(99)<800',
+      ],
+
+      // Solo errores técnicos inesperados
+      register_technical_failed: ['rate<0.01'],
+
+      // No debe haber resultados de negocio inesperados
+      register_business_unexpected: ['rate<0.01'],
     },
+
     scenarios: {
       run: chosen || ALL_SCENARIOS['baseline'],
     },
+
     discardResponseBodies: false,
+
     noConnectionReuse: false,
   };
 }
 
 export const options = buildOptions();
 
-/**
- * =========================
- * Utilidades
- * =========================
- */
 function buildUniqueId(baseId) {
-  // Genera IDs únicos por iteración combinando base del CSV, VU e iteración
-  // Formula: __VU * 1_000_000 + (__ITER % 1_000_000)
-  //
-  // NO se usa baseId como prefijo: al sumarle el bloque del VU los rangos de
-  // dos baseId distintos se solapan y vuelven a colisionar.
-  // Cota: con 600 VUs el maximo es 601_000_000, holgadamente dentro del int
-  // de Java (2_147_483_647) que espera PersonDTO.id.
   return (__VU * 1000000) + (__ITER % 1000000);
 }
 
 function nextPayload() {
   const p = persons[Math.floor(Math.random() * persons.length)];
+
   const uniqueId = buildUniqueId(p.id);
+
   return JSON.stringify({
     name: p.name,
     id: uniqueId,
@@ -172,42 +183,113 @@ function nextPayload() {
   });
 }
 
-/**
- * =========================
- * Iteración principal
- * =========================
- */
 export default function () {
   const payload = nextPayload();
+
   const params = {
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+    },
+
     timeout: `${TIMEOUT_MS}ms`,
-    // Etiquetas opcionales: útiles para filtrar métricas
-    tags: { endpoint: '/register', scenario: SCENARIO },
+
+    tags: {
+      endpoint: '/register',
+      scenario: SCENARIO,
+    },
   };
 
-  const res = http.post(`${BASE_URL}/register`, payload, params);
+  const res = http.post(
+    `${BASE_URL}/register`,
+    payload,
+    params
+  );
 
-  // Métricas
-  registerDuration.add(res.timings.duration, params.tags);
-  statusCount.add(1, { status: String(res.status) });
+  registerDuration.add(
+    res.timings.duration,
+    params.tags
+  );
 
-  // Normalizamos el body para validación robusta
-  const bodyText = String(res.body || '').trim().toUpperCase();
-
-  const ok = check(res, {
-    'status 200': (r) => r.status === 200,
-    // Igualdad exacta, no includes(): 'INVALID_AGE'.includes('VALID') es true,
-    // asi que includes() dejaria pasar un rechazo como si fuera un registro.
-    // trim() y toUpperCase() ya toleran espacios y mayusculas.
-    'body VALID': (_) => bodyText === 'VALID',
+  statusCount.add(1, {
+    status: String(res.status),
   });
 
-  registerFailed.add(!ok);
+  const bodyText = String(res.body || '')
+    .trim()
+    .toUpperCase();
 
-  // Log puntual para diagnóstico (1 de cada 1000 iteraciones por VU)
-  if (!ok && (__ITER % 1000 === 0)) {
-    console.error(`[ERR][${SCENARIO}] status=${res.status} body='${String(res.body).slice(0, 160)}'`);
+  /*
+   * Clasificación de la respuesta
+   *
+   * HTTP 200 + VALID
+   *     -> registro correcto
+   *
+   * HTTP 200 + DUPLICATED
+   *     -> respuesta de negocio válida.
+   *        No se considera error técnico.
+   *
+   * HTTP 200 + otro resultado conocido
+   *     -> rechazo de negocio esperado.
+   *
+   * HTTP diferente de 200
+   *     -> error técnico / HTTP.
+   */
+
+  const isHttpOk = res.status === 200;
+
+  const isValid = isHttpOk && bodyText === 'VALID';
+
+  const isDuplicated =
+    isHttpOk && bodyText === 'DUPLICATED';
+
+  const isKnownBusinessResult =
+    isHttpOk &&
+    (
+      bodyText === 'VALID' ||
+      bodyText === 'DUPLICATED' ||
+      bodyText === 'INVALID' ||
+      bodyText === 'UNDERAGE' ||
+      bodyText === 'DEAD' ||
+      bodyText === 'INVALID_AGE'
+    );
+
+  const isTechnicalFailure = !isHttpOk;
+
+  const isBusinessUnexpected =
+    isHttpOk && !isKnownBusinessResult;
+
+  // Registrar métricas
+  registerValid.add(isValid);
+
+  registerDuplicated.add(isDuplicated);
+
+  registerTechnicalFailed.add(isTechnicalFailure);
+
+  registerBusinessUnexpected.add(isBusinessUnexpected);
+
+  // Checks generales
+  const ok = check(res, {
+    'status 200': () => isHttpOk,
+
+    'resultado de negocio válido': () =>
+      isKnownBusinessResult,
+  });
+
+  /*
+   * Mostrar errores técnicos o resultados inesperados.
+   *
+   * DUPLICATED NO se muestra como error porque
+   * es una respuesta válida del negocio.
+   */
+  if (
+    (!ok || isTechnicalFailure || isBusinessUnexpected) &&
+    (__ITER % 1000 === 0)
+  ) {
+    console.error(
+      `[ERR][${SCENARIO}] status=${res.status} body='${String(
+        res.body
+      ).slice(0, 160)}'`
+    );
   }
 
   if (SLEEP_MS > 0) {
@@ -215,17 +297,11 @@ export default function () {
   }
 }
 
-/**
- * =========================
- * Resumen de salida
- * =========================
- * k6 permite devolver un objeto con rutas de archivos (relativas al cwd)
- * para guardar un resumen de resultados.
- */
 export function handleSummary(data) {
-  // Nombre de archivo según escenario
   const scen = SCENARIO || 'baseline';
+
   const path = `perf/results/summary-${scen}.json`;
+
   return {
     [path]: JSON.stringify(data, null, 2),
   };
