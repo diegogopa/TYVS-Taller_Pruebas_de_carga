@@ -1,17 +1,7 @@
-
-Justo después de `runs-on: ubuntu-latest` y probablemente también al final. Eso **no puede estar dentro del YAML** y por eso GitHub marca el error alrededor de la línea 14.
-
-Reemplaza **TODO** el contenido de `.github/workflows/perf.yml` por este archivo completo:
-
-```yaml
 name: perf-tests
 
-'on':
+on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
-      - master
 
 jobs:
   k6-perf:
